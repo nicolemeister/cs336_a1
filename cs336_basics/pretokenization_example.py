@@ -50,13 +50,32 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 ## Usage
-with open(..., "rb") as f:
+num_processes = 14  # Set to number of cores - 2 for optimal performance
+# with open('/nlp/scr/nmeist/cs336/assignment1-basics/cs336_basics/temp2.txt', "rb") as f:
+with open('/nlp/scr/nmeist/cs336/assignment1-basics/cs336_basics/TinyStoriesV2-GPT4-valid.txt', "rb") as f:
     boundaries = find_chunk_boundaries(
         f, num_processes, "<|endoftext|>".encode("utf-8"))
-        
     # The following is a serial implementation, but you can parallelize this 
     # by sending each start/end pair to a set of processes.
     for start, end in zip(boundaries[:-1], boundaries[1:]):
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         # Run pre-tokenization on your chunk and store the counts for each pre-token
+
+
+    #     # Create a pool of worker processes
+    # with multiprocessing.Pool(processes=num_processes) as pool:
+    #     # Create list of (start, end) pairs to process
+    #     chunk_pairs = list(zip(boundaries[:-1], boundaries[1:]))
+        
+    #     # Define worker function to process each chunk
+    #     def process_chunk(bounds):
+    #         start, end = bounds
+    #         f.seek(start)
+    #         chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    #         # Run pre-tokenization on chunk and store counts
+    #         # TODO: Add pre-tokenization logic here
+    #         return chunk
+            
+    #     # Map chunks to worker processes
+    #     results = pool.map(process_chunk, chunk_pairs)

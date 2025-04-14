@@ -86,3 +86,7 @@ def test_train_bpe_special_tokens(snapshot):
             "merges": merges,
         },
     )
+
+if __name__ == "__main__":
+    test_train_bpe_speed()
+    test_train_bpe()
