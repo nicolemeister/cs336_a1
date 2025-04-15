@@ -4,8 +4,8 @@ from typing import Dict, List, Tuple
 import os
 from pathlib import Path
 import regex as re
-# from .pretokenization_example import find_chunk_boundaries # for the test 
-from pretokenization_example import find_chunk_boundaries # for running bpe.py
+from .pretokenization_example import find_chunk_boundaries # for the test 
+# from pretokenization_example import find_chunk_boundaries # for running bpe.py
 import multiprocessing
 from dataclasses import dataclass
 from abc import ABC
@@ -341,7 +341,7 @@ def train_bpe(
 
     return vocab, merges
 
-
+'''
 if __name__ == "__main__":
     # import arg 
     import argparse
@@ -359,7 +359,7 @@ if __name__ == "__main__":
         process = psutil.Process(os.getpid())
         initial_memory = process.memory_info().rss / (1024 * 1024)
 
-            vocab, merges = run_train_bpe('data/TinyStoriesV2-GPT4-train.txt', 10000, ['<|endoftext|>'])
+        vocab, merges = run_train_bpe('data/TinyStoriesV2-GPT4-train.txt', 10000, ['<|endoftext|>'])
 
         end_time = time.time()
         final_memory = process.memory_info().rss / (1024 * 1024)
@@ -393,7 +393,7 @@ if __name__ == "__main__":
         # print the longest token in the vocabulary
         print("Longest token: ", max(vocab.values(), key=len))
 
-
+'''
 # vocab, merges = run_train_bpe('cs336_basics/temp.txt', (256+1+6), ['<|endoftext|>'])
 
 # print(vocab)

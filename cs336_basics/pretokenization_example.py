@@ -49,6 +49,9 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+
+
+'''
 ## Usage
 num_processes = 14  # Set to number of cores - 2 for optimal performance
 # with open('/nlp/scr/nmeist/cs336/assignment1-basics/cs336_basics/temp2.txt', "rb") as f:
@@ -78,4 +81,6 @@ with open('/nlp/scr/nmeist/cs336/assignment1-basics/cs336_basics/TinyStoriesV2-G
     #         return chunk
             
     #     # Map chunks to worker processes
-    #     results = pool.map(process_chunk, chunk_pairs)
+    #     results = pool.map(process_chunk, chunk_pair)
+
+'''
