@@ -4,13 +4,18 @@ from typing import Dict, List, Tuple
 import os
 from pathlib import Path
 import regex as re
-from .pretokenization_example import find_chunk_boundaries # for the test 
-# from pretokenization_example import find_chunk_boundaries # for running bpe.py
+# from .pretokenization_example import find_chunk_boundaries # for the test 
+from pretokenization_example import find_chunk_boundaries # for running bpe.py
 import multiprocessing
-from tqdm import tqdm
 from dataclasses import dataclass
 from abc import ABC
 from typing import List, Tuple, Dict, Iterable, Iterator
+from tqdm import tqdm
+import gc
+import cProfile
+import pstats
+import io
+import mmap
 
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
@@ -36,8 +41,9 @@ class BPETokenizer(Tokenizer):
     def __init__(self, params: BPETokenizerParams, special_tokens=None):
         self.params = params
         self.special_tokens = special_tokens
-        self.reverse_vocab = {v: k for k, v in self.params.vocab.items()} # find some way to do "is prefix"
-        self.max_len_token = max([len(word) for word in self.params.vocab.values()]) # 128 
+        self.reverse_vocab = {v: k for k, v in self.params.vocab.items()}
+        self.max_len_token = max(len(word) for word in self.params.vocab.values())
+        gc.collect()  # Clean up any unused memory after initialization
 
     @classmethod
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
@@ -116,98 +122,65 @@ class BPETokenizer(Tokenizer):
 
 
 # worker function to process each chunk
-def process_chunk(bounds, special_tokens, file_path):
+def process_chunk(start, end, special_tokens, file_path):
     """Process a single chunk of text for BPE training.
+    Remove special tokens, pre-tokenize the chunk, then count the frequency of each byte pair.
     
     Args:
-        bounds: Tuple of (start, end) positions in the file
+        start: start position in the file
+        end: end position in the file
         special_tokens: List of special tokens to handle
         file_path: Path to the input file
     """
-    start, end = bounds
     byte_pairs = Counter()
     freq_table = defaultdict(int)
     
     # Pre-compile patterns for better performance
     escaped_special_tokens = [re.escape(token) for token in special_tokens]
-    split_pattern = re.compile('|'.join(escaped_special_tokens))
-    special_tokens_set = set(special_tokens)
+    split_pattern = "|".join(escaped_special_tokens)
     
-    # Process text in smaller segments to reduce memory usage
-    segment_size = 1024 * 1024  # 1MB segments
-    
-    try:
-        with open(file_path, 'rb') as f:
-            f.seek(start)
-            remaining = end - start
+    with open(file_path, 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            mm.seek(start)
+            chunk = mm.read(end - start)
+            chunk = chunk.decode("utf-8", errors="ignore")
             
-            while remaining > 0:
-                # Read next segment
-                read_size = min(segment_size, remaining)
-                chunk = f.read(read_size)
-                if not chunk:  # End of file
-                    break
+            # Split on special tokens and process each part separately
+            parts = [p for p in re.split(split_pattern, chunk) if p.strip()]
+            
+            # Process each part separately to prevent merging across special tokens
+            for part in parts:
+                # Pre-tokenize the part
+                for word in PAT.finditer(part):
+                    word_text = word.group()
                     
-                try:
-                    chunk = chunk.decode("utf-8", errors="ignore")
-                except UnicodeDecodeError:
-                    continue
+                    # Process word bytes (count byte pairs and tuples) 
+                    word_bytes = word_text.encode('utf-8')
+                    word_tuple = tuple(bytes([b]) for b in word_bytes)
                     
-                remaining -= read_size
-                
-                # Process special tokens first
-                parts = []
-                current_pos = 0
-                for match in split_pattern.finditer(chunk):
-                    if match.start() > current_pos:
-                        parts.append(chunk[current_pos:match.start()])
-                    parts.append(match.group())
-                    current_pos = match.end()
-                
-                # Add remaining text
-                if current_pos < len(chunk):
-                    parts.append(chunk[current_pos:])
-                
-                # Process each part
-                for part in parts:
-                    if not part.strip() or part in special_tokens_set:
-                        continue
-                    
-                    # Process words in the part
-                    for word in PAT.finditer(part):
-                        word_text = word.group()
-                        if not word_text:
-                            continue
+                    if word_tuple:
+                        freq_table[word_tuple] += 1
                         
-                        # Process word bytes
-                        word_bytes = word_text.encode('utf-8')
-                        word_tuple = tuple(bytes([b]) for b in word_bytes)
-                        
-                        if word_tuple:
-                            freq_table[word_tuple] += 1
-                            
-                            # Process byte pairs directly without list comprehension
-                            word_len = len(word_bytes)
-                            for i in range(word_len - 1):
-                                pair = (bytes([word_bytes[i]]), bytes([word_bytes[i + 1]]))
-                                byte_pairs[pair] += 1
-                                
-    except Exception as e:
-        print(f"Error processing chunk {start}-{end}: {str(e)}")
-        return Counter(), defaultdict(int)
-    
+                        # Process byte pairs
+                        word_len = len(word_bytes)
+                        for i in range(word_len - 1):
+                            pair = (bytes([word_bytes[i]]), bytes([word_bytes[i + 1]]))
+                            byte_pairs[pair] += 1
+
+            gc.collect()
+        
     return byte_pairs, freq_table
 
 def process_chunk_wrapper(args):
     """Wrapper function to unpack arguments for process_chunk.
     
     Args:
-        args: Tuple containing (bounds, special_tokens, file_path)
+        args: Tuple containing (start, end, special_tokens, file_path)
     """
-    bounds, special_tokens, file_path = args
-    return process_chunk(bounds, special_tokens, file_path)
+    start, end, special_tokens, file_path = args
+    return process_chunk(start, end, special_tokens, file_path)
 
-def run_train_bpe(
+def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
@@ -215,6 +188,11 @@ def run_train_bpe(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
     output its vocabulary and merges.
+    
+    Args:
+        input_path: Path to input text file
+        vocab_size: Target vocabulary size
+        special_tokens: List of special tokens to handle
     """
     # Initialize vocab with special tokens
     vocab = {} # dict[int, bytes]
@@ -225,41 +203,55 @@ def run_train_bpe(
     for i, token in enumerate(special_tokens):
         vocab[i] = token.encode('utf-8')
     
-    print("Adding byte vocabulary after special tokens ...")
+    print("Adding byte vocabulary...")
     # Add byte vocabulary after special tokens
     for i in range(256):
         vocab[len(special_tokens) + i] = bytes([i])
     
-    # Use fewer processes for small files to avoid overhead
-    num_processes = min(14, max(1, file_size // (1024 * 1024)))  # One process per MB, up to 14 # IS MY CHUNK SIZE TOO SMALL?
-    # print(f"Using {num_processes} processes for file size {file_size/1024/1024:.2f}MB")
-    
+    # Set fixed number of chunks
+    num_chunks = 32
+    file_size = os.path.getsize(input_path)
+    print(f"Attempting to split {file_size/1024/1024:.2f}MB file into {num_chunks} chunks")
     
     print("Reading input text and finding chunk boundaries...")
-    # Read input text
-    with open(input_path, 'rb') as f:  
-        boundaries = find_chunk_boundaries(f, num_processes, "<|endoftext|>".encode("utf-8"))
-        print("boundaries: ", len(boundaries))
+    # Read input text and get chunk boundaries that don't split special tokens
+    total_byte_pairs = Counter()
+    total_freq_table = defaultdict(int)
 
-
-        print("Processing chunks with multiprocessing pool...")
-        # Create a pool of worker processes
-        with multiprocessing.Pool(processes=num_processes) as pool:
+    print("Input path: ",input_path)
+    with open(input_path, 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            # find_chunk_boundaries ensures chunks start at special tokens
+            # may return fewer chunks if boundaries would overlap
+            boundaries = find_chunk_boundaries(
+                mm, num_chunks, "<|endoftext|>".encode("utf-8"))
+            print(f"Found {len(boundaries)-1} valid chunk boundaries", boundaries)
+            
             # Create list of (start, end) pairs to process
             chunk_pairs = list(zip(boundaries[:-1], boundaries[1:]))
+
+            print("Processing chunks with multiprocessing pool...")
+            # Create a pool of worker processes with a reasonable number of processes
+            # Use number of CPU cores as a reasonable default
+            num_processes = min(multiprocessing.cpu_count(), len(chunk_pairs))
+            print(f"Using {num_processes} processes")
             
             # Prepare arguments for each chunk
-            chunk_args = [(bounds, special_tokens, input_path) for bounds in chunk_pairs]
+            chunk_args = [(start, end, special_tokens, input_path) for start, end in chunk_pairs]
             
-            # Use imap_unordered for faster results as they come in
-            print("Combining results from all processes...")
-            total_byte_pairs = Counter()
-            total_freq_table = defaultdict(int)
-            for result in tqdm(pool.imap_unordered(process_chunk_wrapper, chunk_args), total=len(chunk_args)):
-                byte_pairs, freq_table = result
-                total_byte_pairs.update(byte_pairs)
-                for word_tuple, count in freq_table.items():
-                    total_freq_table[word_tuple] += count
+            # Process chunks with progress bar
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                for byte_pairs, freq_table in tqdm(
+                    pool.imap_unordered(process_chunk_wrapper, chunk_args),
+                    total=len(chunk_args),
+                    desc="Processing chunks"
+                ):
+                    total_byte_pairs.update(byte_pairs)
+                    for word_tuple, count in freq_table.items():
+                        total_freq_table[word_tuple] += count
+                    
+                    # Clean up memory after processing each chunk
+                    gc.collect()
 
     print("Beginning BPE merges...")
     print(f"Target vocabulary size: {vocab_size}")
@@ -288,9 +280,6 @@ def run_train_bpe(
         if any(b"<|" in token for token in best_pair):
             del total_byte_pairs[best_pair]
             continue
-            
-        if current_vocab_size % 100 == 0:
-            print(f"Vocabulary size: {current_vocab_size}")
             
         # add merged pair to vocab
         merged_bytes = bytes(best_pair[0] + best_pair[1])
@@ -349,53 +338,89 @@ def run_train_bpe(
 
     return vocab, merges
 
-# if __name__ == "__main__":
-#     import time
-#     import psutil
+if __name__ == "__main__":
+    # import arg 
+    import argparse
+    import time
+    import psutil
 
-#     # TS 
-#     start_time = time.time()
-#     process = psutil.Process(os.getpid())
-#     initial_memory = process.memory_info().rss / (1024 * 1024)
+    parser = argparse.ArgumentParser(description='Train a BPE tokenizer')
+    parser.add_argument('--dataset', type=str, default = 'TS', choices = ['TS', 'OWT'])
+    
+    args = parser.parse_args()
 
-#     vocab, merges = run_train_bpe('data/TinyStoriesV2-GPT4-train.txt', 10000, ['<|endoftext|>'])
+    if args.dataset == 'TS':
+        # TS 
+        start_time = time.time()
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss / (1024 * 1024)
 
-#     end_time = time.time()
-#     final_memory = process.memory_info().rss / (1024 * 1024)
+        vocab, merges = train_bpe('/data/a1-basics/TinyStoriesV2-GPT4-train.txt', 10000, ['<|endoftext|>'])
 
-#     time_taken = end_time - start_time
-#     memory = final_memory - initial_memory
+        end_time = time.time()
+        final_memory = process.memory_info().rss / (1024 * 1024)
 
-#     print("TS")
-#     print("time_taken: ", time_taken)
-#     print("max_memory (MB): ", memory)
-#     # print the longest token in the vocabulary
-#     print("Longest token: ", max(vocab.values(), key=len))
+        time_taken = end_time - start_time
+        memory = final_memory - initial_memory
+
+        # Write to output.txt instead of printing
+
+        with open('ts_output.txt', 'w') as f:
+            f.write("TS\n")
+            f.write(f"time_taken: {time_taken}\n")
+            f.write(f"max_memory (MB): {memory}\n")
+            f.write(f"Longest token: {max(vocab.values(), key=len)}\n")
+
+        print("TS")
+        print("time_taken: ", time_taken)
+        print("max_memory (MB): ", memory)
+        # print the longest token in the vocabulary
+        print("Longest token: ", max(vocab.values(), key=len))
+        import json
+        with open('ts_vocab.json', 'w') as f:
+            json.dump(vocab, f)
+        with open('ts_merges.json', 'w') as f:
+            json.dump(merges, f)
+    
+    elif args.dataset == 'OWT':
+        # OWT 
+        start_time = time.time()
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss / (1024 * 1024)
+
+        vocab, merges = train_bpe('/data/a1-basics/owt_train.txt',  32000, ['<|endoftext|>'])
+
+        end_time = time.time()
+        final_memory = process.memory_info().rss / (1024 * 1024)
+
+        time_taken = end_time - start_time
+        memory = final_memory - initial_memory
+
+        print("OWT")
+        print("time_taken: ", time_taken)
+        print("max_memory (MB): ", memory)
+        # print the longest token in the vocabulary
+        print("Longest token: ", max(vocab.values(), key=len))
+
+        with open('owt_output.txt', 'w') as f:
+            f.write("owt\n")
+            f.write(f"time_taken: {time_taken}\n")
+            f.write(f"max_memory (MB): {memory}\n")
+            f.write(f"Longest token: {max(vocab.values(), key=len)}\n")
+        import json
+        with open('owt_vocab.json', 'w') as f:
+            json.dump(vocab, f)
+        with open('owt_merges.json', 'w') as f:
+            json.dump(merges, f)
 
 
-#     # OWT 
-#     start_time = time.time()
-#     process = psutil.Process(os.getpid())
-#     initial_memory = process.memory_info().rss / (1024 * 1024)
+# vocab, merges = run_train_bpe('cs336_basics/temp.txt', (256+1+6), ['<|endoftext|>'])
 
-#     vocab, merges = run_train_bpe('data/owt_train.txt',  32000, ['<|endoftext|>'])
-
-#     end_time = time.time()
-#     final_memory = process.memory_info().rss / (1024 * 1024)
-
-#     time_taken = end_time - start_time
-#     memory = final_memory - initial_memory
-
-#     print("OWT")
-#     print("time_taken: ", time_taken)
-#     print("max_memory (MB): ", memory)
-#     # print the longest token in the vocabulary
-#     print("Longest token: ", max(vocab.values(), key=len))
-
+# print(vocab)
+# print(merges)
 
 # vocab, merges = run_train_bpe('cs336_basics/TinyStoriesV2-GPT4-valid.txt', 1000, ['<|endoftext|>'])
-# # run_train_bpe('cs336_basics/TinyStoriesV2-GPT4-valid.txt', 1000, ['<|endoftext|>'])
-# # vocab, merges = run_train_bpe('cs336_basics/temp.txt', (256+1+6), ['<|endoftext|>'])
+# # # run_train_bpe('cs336_basics/TinyStoriesV2-GPT4-valid.txt', 1000, ['<|endoftext|>'])
 
 # print(vocab)
 # print(merges)
